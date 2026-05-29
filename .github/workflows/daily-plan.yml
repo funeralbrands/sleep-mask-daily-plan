@@ -1,0 +1,35 @@
+name: Daily to-do plan to Slack
+
+# Runs entirely on GitHub's servers — no need for any of your devices to be on.
+on:
+  schedule:
+    # Two fixed UTC times so one of them is always 9 AM US Eastern:
+    #   13:00 UTC = 9 AM EDT (summer, daylight time)
+    #   14:00 UTC = 9 AM EST (winter, standard time)
+    # The script checks the real Eastern time and exits on the "wrong" one,
+    # so you only ever get ONE message at 9 AM Eastern, year-round.
+    - cron: "0 13 * * *"
+    - cron: "0 14 * * *"
+  workflow_dispatch:   # the "Run workflow" button for manual / test runs
+
+jobs:
+  send-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run daily plan
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Manual "Run workflow" presses skip the 9 AM time gate so you can test
+          # any time. Scheduled runs leave this empty and obey the gate.
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && 'true' || '' }}
+        run: python daily_plan.py
