@@ -360,6 +360,39 @@ def post_to_slack(webhook_url, text):
 
 
 # ----------------------------------------------------------------------------
+# Once-per-day guard (survives GitHub's unreliable scheduler)
+# ----------------------------------------------------------------------------
+# The workflow fires several times across the morning so a delayed trigger is
+# covered by the next one. To avoid posting more than once, we record the date we
+# last sent in a small file that GitHub Actions persists between runs via its
+# cache. The first run that posts on a given Eastern day "claims" the day; later
+# runs see the marker and skip.
+
+STATE_DIR = ".state"
+STATE_FILE = os.path.join(STATE_DIR, "last_sent_date.txt")
+
+# Send only within this Eastern-time window (hours, 24h). Normally the 9 AM
+# trigger fires on time; the upper bound lets a badly delayed GitHub run still
+# deliver late-morning rather than not at all.
+SEND_WINDOW_START_HOUR = 9
+SEND_WINDOW_END_HOUR = 14  # exclusive — i.e. 9:00 AM up to 1:59 PM ET
+
+
+def already_sent_today(today_str):
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip() == today_str
+    except FileNotFoundError:
+        return False
+
+
+def mark_sent_today(today_str):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        f.write(today_str)
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -372,36 +405,46 @@ def main():
     if not notion_token or not slack_url:
         raise SystemExit("Missing NOTION_TOKEN and/or SLACK_WEBHOOK_URL.")
 
-    now_eastern = datetime.now(EASTERN)
-    # Time gate: the workflow fires at 13:00 AND 14:00 UTC so one of them lands on
-    # 9 AM Eastern year-round. Exit unless it's really the 9 o'clock hour.
-    if not force and now_eastern.hour != 9:
-        print(f"Not 9 AM Eastern (now {now_eastern:%H:%M %Z}); skipping. "
-              f"Set FORCE_SEND=true to override.")
-        return
+    os.makedirs(STATE_DIR, exist_ok=True)  # ensure the cache path always exists
 
+    now_eastern = datetime.now(EASTERN)
     today = now_eastern.date()
+    today_str = today.isoformat()
+
+    # Manual "Run workflow" (FORCE_SEND) bypasses BOTH the window and the daily
+    # guard, and never writes the marker — so a manual test can't suppress the
+    # real morning run.
+    if not force:
+        if not (SEND_WINDOW_START_HOUR <= now_eastern.hour < SEND_WINDOW_END_HOUR):
+            print(f"Outside the {SEND_WINDOW_START_HOUR}:00–{SEND_WINDOW_END_HOUR}:00 "
+                  f"ET send window (now {now_eastern:%H:%M %Z}); skipping.")
+            return
+        if already_sent_today(today_str):
+            print(f"Already sent today ({today_str}); skipping duplicate.")
+            return
+
     tasks = fetch_tasks(notion_token)
     print(f"Fetched {len(tasks)} tasks from Notion.")
 
     focus, todos, confirmed = choose_plan(tasks, today)
     if focus is None:
-        text = (f"🌙 *Today — {today.strftime('%a, %b %-d')}*\n"
-                "No active tasks on the board — everything's marked Done. "
-                "Set the next focus when you get a sec. ⚡")
-        post_to_slack(slack_url, text)
-        return
-
-    glance = build_glance(focus, todos, today)
-    if anthropic_key:
-        print("ANTHROPIC_API_KEY found — composing PART 2 with Claude.")
-        details = build_details_ai(focus, todos, confirmed, anthropic_key)
+        message = (f"🌙 *Today — {today.strftime('%a, %b %-d')}*\n"
+                   "No active tasks on the board — everything's marked Done. "
+                   "Set the next focus when you get a sec. ⚡")
     else:
-        print("No ANTHROPIC_API_KEY — building PART 2 directly.")
-        details = build_details_direct(focus, todos, confirmed)
+        glance = build_glance(focus, todos, today)
+        if anthropic_key:
+            print("ANTHROPIC_API_KEY found — composing PART 2 with Claude.")
+            details = build_details_ai(focus, todos, confirmed, anthropic_key)
+        else:
+            print("No ANTHROPIC_API_KEY — building PART 2 directly.")
+            details = build_details_direct(focus, todos, confirmed)
+        message = glance + DIVIDER + details
 
-    message = glance + DIVIDER + details
-    post_to_slack(slack_url, message)
+    post_to_slack(slack_url, message)  # raises on failure, so reaching here == sent
+    if not force:
+        mark_sent_today(today_str)
+        print(f"Marked {today_str} as sent.")
 
 
 if __name__ == "__main__":

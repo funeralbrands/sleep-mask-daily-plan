@@ -3,14 +3,27 @@ name: Daily to-do plan to Slack
 # Runs entirely on GitHub's servers — no need for any of your devices to be on.
 on:
   schedule:
-    # Two fixed UTC times so one of them is always 9 AM US Eastern:
-    #   13:00 UTC = 9 AM EDT (summer, daylight time)
-    #   14:00 UTC = 9 AM EST (winter, standard time)
-    # The script checks the real Eastern time and exits on the "wrong" one,
-    # so you only ever get ONE message at 9 AM Eastern, year-round.
+    # GitHub's free scheduler is UTC-only and often runs LATE (sometimes by an
+    # hour or more). So we fire several times across the morning and let the
+    # script decide: it posts once, only inside the 9 AM–2 PM Eastern window, and
+    # records the day in a cached marker so the extra triggers don't double-post.
+    # These UTC times cover ~9 AM–noon Eastern in both EDT (summer) and EST
+    # (winter); the script's window + once-per-day guard sort out the rest.
     - cron: "0 13 * * *"
+    - cron: "30 13 * * *"
     - cron: "0 14 * * *"
+    - cron: "30 14 * * *"
+    - cron: "0 15 * * *"
+    - cron: "30 15 * * *"
+    - cron: "0 16 * * *"
+    - cron: "30 16 * * *"
   workflow_dispatch:   # the "Run workflow" button for manual / test runs
+
+# Never let two delayed runs execute at the same instant (would risk a double
+# post before the marker is saved). Queue them instead.
+concurrency:
+  group: daily-plan
+  cancel-in-progress: false
 
 jobs:
   send-plan:
@@ -24,12 +37,29 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Restore the "last sent date" marker saved by an earlier run today.
+      - name: Restore send-state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: send-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            send-state-
+
       - name: Run daily plan
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Manual "Run workflow" presses skip the 9 AM time gate so you can test
-          # any time. Scheduled runs leave this empty and obey the gate.
+          # Manual "Run workflow" presses skip the window + once-per-day guard so
+          # you can test any time. Scheduled runs leave this empty and obey both.
           FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && 'true' || '' }}
         run: python daily_plan.py
+
+      # Persist the (possibly updated) marker for the rest of today's triggers.
+      - name: Save send-state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: send-state-${{ github.run_id }}-${{ github.run_attempt }}
